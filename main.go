@@ -57,6 +57,7 @@ func main() {
 			rw.Write([]byte("There was an error processing the request"))
 			return
 		}
+		defer response.Body.Close()
 
 		// we have to copy the response headers from the actual server
 		// and write them to the response for the client. else, we might miss
@@ -69,8 +70,73 @@ func main() {
 			}
 		}
 
-		rw.WriteHeader(response.StatusCode)
-		io.Copy(rw, response.Body)
+		// we need to handle cases of streaming responses and be sending
+		// the response back to the client as it comes in.
+		if isStreaming(response) {
+			// we need to get the underlying connection to the client so
+			// that we can write to it as the response comes in
+			// we can use the hijacker interface to do this
+			hijacker, ok := rw.(http.Hijacker)
+			if !ok {
+				http.Error(rw, "Streaming unsupported", http.StatusInternalServerError)
+				return
+			}
+			conn, bufrw, err := hijacker.Hijack()
+			if err != nil {
+				http.Error(rw, "Streaming unsupported", http.StatusInternalServerError)
+				return
+			}
+			defer conn.Close()
+
+			fmt.Fprintf(bufrw, "HTTP/1.1 %d %s\r\n", response.StatusCode, http.StatusText(response.StatusCode))
+			response.Header.Write(bufrw)
+			fmt.Fprintf(bufrw, "\r\n")
+			bufrw.Flush()
+
+			done := make(chan bool) // channel to signal when the streaming is done
+
+			// let's start a goroutine to handle the streaming of the data to the client
+			go func() {
+				buffer := make([]byte, 32*1024)
+				for {
+					// Read from response body
+					n, err := response.Body.Read(buffer)
+					if n > 0 {
+						_, writeErr := bufrw.Write(buffer[:n])
+						if writeErr != nil {
+							fmt.Printf("Error writing to client: %v\n", writeErr)
+							break
+						}
+						bufrw.Flush()
+					}
+					if err != nil {
+						if err != io.EOF {
+							fmt.Printf("Error reading from response: %v\n", err)
+						}
+						break
+					}
+				}
+				done <- true
+			}()
+
+			// Wait for either completion or connection close.
+			// we send in a done channel to signal when the streaming is done
+			select {
+			case <-done:
+				fmt.Println("Streaming completed")
+			case <-req.Context().Done():
+				fmt.Println("Client disconnected")
+			}
+		} else {
+			rw.WriteHeader(response.StatusCode)
+			io.Copy(rw, response.Body)
+		}
 	})
 	http.ListenAndServe(":8080", proxy)
+}
+
+func isStreaming(response *http.Response) bool {
+	return response.Header.Get("Content-Type") == "text/event-stream" ||
+		response.Header.Get("Transfer-Encoding") == "chunked" ||
+		response.Header.Get("Connection") == "keep-alive"
 }
