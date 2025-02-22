@@ -24,6 +24,10 @@ import (
 // and send them back to the client.
 // this is going to be for a bigger project. building a minimal traefik
 
+type Client struct {
+	client *client.Client
+}
+
 func main() {
 	// a reverse proxy must have an actual url to forward the requests to
 	// at the moment, this will be a hardcoded http server that we spin up
@@ -138,7 +142,14 @@ func main() {
 			io.Copy(rw, response.Body)
 		}
 	})
-	go listenToContainerEvents()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		panic(err)
+	}
+	dockerClient := Client{
+		client: cli,
+	}
+	go dockerClient.listenToContainerEvents()
 	http.ListenAndServe(":8080", proxy)
 }
 
@@ -148,7 +159,7 @@ func isStreaming(response *http.Response) bool {
 		response.Header.Get("Connection") == "keep-alive"
 }
 
-func listenToContainerEvents() {
+func (c *Client) listenToContainerEvents() {
 	// we are to listen to events from docker here and process events about
 	// a container, such as a new container being created, a container being
 	// started, a container being stopped, a container being removed, etc.
@@ -156,12 +167,8 @@ func listenToContainerEvents() {
 	// and the details of the service that will be serving up requests for
 	// that container.
 	fmt.Println("Listening to container events...")
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		panic(err)
-	}
 
-	eventsChan, errChan := cli.Events(context.Background(), events.ListOptions{
+	eventsChan, errChan := c.client.Events(context.Background(), events.ListOptions{
 		Filters: filters.NewArgs(filters.KeyValuePair{Key: "type", Value: "container"}),
 	})
 
@@ -169,7 +176,7 @@ func listenToContainerEvents() {
 		for {
 			select {
 			case event := <-eventsChan:
-				processContainerEvent(event)
+				c.processContainerEvent(event)
 			case err := <-errChan:
 				if err != nil {
 					panic(err)
@@ -181,7 +188,7 @@ func listenToContainerEvents() {
 
 // processContainerEvent processes a container event and updates the routing table
 // based on the event type.
-func processContainerEvent(event events.Message) {
+func (c *Client) processContainerEvent(event events.Message) {
 	switch event.Status {
 	case "start", "update":
 		// Continue processing
@@ -189,15 +196,14 @@ func processContainerEvent(event events.Message) {
 		return // Ignore other events
 	}
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	container, err := c.client.ContainerInspect(context.Background(), event.Actor.ID)
 	if err != nil {
-		fmt.Printf("Error creating Docker client: %v\n", err)
+		fmt.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
 		return
 	}
-	defer cli.Close()
 
 	// Fetch complete container details to get all labels
-	container, err := cli.ContainerInspect(context.Background(), event.Actor.ID)
+	container, err = c.client.ContainerInspect(context.Background(), event.Actor.ID)
 	if err != nil {
 		fmt.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
 		return
