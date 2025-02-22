@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
+
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
 )
 
 // writing a reverse proxy for the minimal traefik project.
@@ -132,6 +138,7 @@ func main() {
 			io.Copy(rw, response.Body)
 		}
 	})
+	go listenToContainerEvents()
 	http.ListenAndServe(":8080", proxy)
 }
 
@@ -139,4 +146,131 @@ func isStreaming(response *http.Response) bool {
 	return response.Header.Get("Content-Type") == "text/event-stream" ||
 		response.Header.Get("Transfer-Encoding") == "chunked" ||
 		response.Header.Get("Connection") == "keep-alive"
+}
+
+func listenToContainerEvents() {
+	// we are to listen to events from docker here and process events about
+	// a container, such as a new container being created, a container being
+	// started, a container being stopped, a container being removed, etc.
+	// we will then update the routing table with the details of the container
+	// and the details of the service that will be serving up requests for
+	// that container.
+	fmt.Println("Listening to container events...")
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		panic(err)
+	}
+
+	eventsChan, errChan := cli.Events(context.Background(), events.ListOptions{
+		Filters: filters.NewArgs(filters.KeyValuePair{Key: "type", Value: "container"}),
+	})
+
+	go func() {
+		for {
+			select {
+			case event := <-eventsChan:
+				processContainerEvent(event)
+			case err := <-errChan:
+				if err != nil {
+					panic(err)
+				}
+			}
+		}
+	}()
+}
+
+// processContainerEvent processes a container event and updates the routing table
+// based on the event type.
+func processContainerEvent(event events.Message) {
+	switch event.Status {
+	case "start", "update":
+		// Continue processing
+	default:
+		return // Ignore other events
+	}
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		fmt.Printf("Error creating Docker client: %v\n", err)
+		return
+	}
+	defer cli.Close()
+
+	// Fetch complete container details to get all labels
+	container, err := cli.ContainerInspect(context.Background(), event.Actor.ID)
+	if err != nil {
+		fmt.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
+		return
+	}
+
+	// Check if container should be managed by traefik. If not, we don't need to process it
+	// we will need to check the routing table to see if this container is being used in any of the routes
+	// and if so, we need to remove it from the routing table.
+	// todo: implement this
+	if enabled, exists := container.Config.Labels["traefik.enable"]; !exists || enabled != "true" {
+		fmt.Printf("Container %s is not enabled for traefik\n", container.Name)
+		return
+	}
+
+	containerName := strings.TrimPrefix(container.Name, "/") // Remove leading slash
+	labels := container.Config.Labels
+
+	config := TraefikConfig{
+		ContainerID:   container.ID,
+		ContainerName: containerName,
+		Labels:        make(map[string]string),
+	}
+
+	// Extract all traefik-related labels from the container
+	for key, value := range labels {
+		if strings.HasPrefix(key, "traefik.") {
+			config.Labels[key] = value
+		}
+	}
+
+	// Get the main routing configuration specified in the labels
+	routerName := getRouterName(labels, containerName)
+	config.Rule = labels[fmt.Sprintf("traefik.http.routers.%s.rule", routerName)]
+	config.Port = labels[fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", routerName)]
+
+	fmt.Printf("Traefik Configuration for %s:\n", containerName)
+	fmt.Printf("  Container ID: %s\n", config.ContainerID)
+	fmt.Printf("  Router Name: %s\n", routerName)
+	fmt.Printf("  Rule: %s\n", config.Rule)
+	fmt.Printf("  Port: %s\n", config.Port)
+	fmt.Printf("  All Labels: %v\n", config.Labels)
+
+	// TODO: Update your routing table here
+	updateRoutingTable(config)
+}
+
+// TraefikConfig holds the parsed configuration for a container
+type TraefikConfig struct {
+	ContainerID   string
+	ContainerName string
+	Rule          string
+	Port          string
+	Labels        map[string]string
+}
+
+// getRouterName tries to determine the router name from labels or falls back to container name
+func getRouterName(labels map[string]string, containerName string) string {
+	for key := range labels {
+		if strings.HasPrefix(key, "traefik.http.routers.") && strings.HasSuffix(key, ".rule") {
+			parts := strings.Split(key, ".")
+			if len(parts) > 3 {
+				return parts[3]
+			}
+		}
+	}
+	// Fall back to container name
+	return containerName
+}
+
+// updateRoutingTable updates the routing table with the details of the container
+// this will be a map of the router name to the details of the container
+// that is serving up requests for that router.
+func updateRoutingTable(config TraefikConfig) {
+	// Implement your routing table update logic here
+	// This could be updating a shared map, database, or other storage
 }
