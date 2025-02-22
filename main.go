@@ -225,6 +225,16 @@ func (c *Client) processContainerEvent(event events.Message) {
 		ContainerID:   container.ID,
 		ContainerName: containerName,
 		Labels:        make(map[string]string),
+		Networks:      make(map[string]string),
+	}
+
+	// Extract network information from the container
+	for networkName, network := range container.NetworkSettings.Networks {
+		config.Networks[networkName] = network.IPAddress
+		// Use the first network's IP as the default IPAddress
+		if config.IPAddress == "" {
+			config.IPAddress = network.IPAddress
+		}
 	}
 
 	// Extract all traefik-related labels from the container
@@ -237,6 +247,7 @@ func (c *Client) processContainerEvent(event events.Message) {
 	// Get the main routing configuration specified in the labels
 	routerName := getRouterName(labels, containerName)
 	config.Rule = labels[fmt.Sprintf("traefik.http.routers.%s.rule", routerName)]
+	config.Domain = getCleanDomainFromHostLabel(config.Rule)
 	config.Port = labels[fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", routerName)]
 
 	fmt.Printf("Traefik Configuration for %s:\n", containerName)
@@ -244,8 +255,10 @@ func (c *Client) processContainerEvent(event events.Message) {
 	fmt.Printf("  Router Name: %s\n", routerName)
 	fmt.Printf("  Rule: %s\n", config.Rule)
 	fmt.Printf("  Port: %s\n", config.Port)
+	fmt.Printf("  IP Address: %s\n", config.IPAddress)
+	fmt.Printf("  Networks: %v\n", config.Networks)
 	fmt.Printf("  All Labels: %v\n", config.Labels)
-
+	fmt.Printf("  Domain: %s\n", config.Domain)
 	// TODO: Update your routing table here
 	updateRoutingTable(config)
 }
@@ -254,8 +267,11 @@ func (c *Client) processContainerEvent(event events.Message) {
 type TraefikConfig struct {
 	ContainerID   string
 	ContainerName string
+	Domain        string
 	Rule          string
 	Port          string
+	IPAddress     string
+	Networks      map[string]string
 	Labels        map[string]string
 }
 
@@ -271,6 +287,20 @@ func getRouterName(labels map[string]string, containerName string) string {
 	}
 	// Fall back to container name
 	return containerName
+}
+
+// getCleanDomainFromHostLabel should get the actual domain in the Host rule
+// for example, if the host rule is "Host(`example.com`)", the domain should be
+// "example.com"
+func getCleanDomainFromHostLabel(label string) string {
+	// we need to parse the label and get the domain from the Host rule
+	// the label will be in the format of "Host(`example.com`)", so we need to
+	// extract the domain from the Host rule
+	parts := strings.Split(label, "`")
+	if len(parts) > 1 {
+		return parts[1]
+	}
+	return ""
 }
 
 // updateRoutingTable updates the routing table with the details of the container
