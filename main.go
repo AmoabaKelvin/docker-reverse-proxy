@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
@@ -61,10 +62,22 @@ func main() {
 		// the sample server we have, we have to make sure that we now perform
 		// the request to that particular server and get the response and write it
 		// back to the client
+
+		// we don't want the whole process to block forever if the backend is rather
+		// not responding or slow, we need to set a timeout for the request.
+		// we have a 30 second timeout for the whole process.
+		ctx, cancel := context.WithTimeout(req.Context(), 30*time.Second)
+		defer cancel()
+		req = req.WithContext(ctx)
 		response, err := http.DefaultClient.Do(req)
 		if err != nil {
-			rw.WriteHeader(http.StatusInternalServerError)
-			rw.Write([]byte("There was an error processing the request"))
+			if ctx.Err() == context.DeadlineExceeded {
+				rw.WriteHeader(http.StatusGatewayTimeout)
+				rw.Write([]byte("The request timed out"))
+			} else {
+				rw.WriteHeader(http.StatusInternalServerError)
+				rw.Write([]byte("There was an error processing the request"))
+			}
 			return
 		}
 		defer response.Body.Close()
