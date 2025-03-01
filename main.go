@@ -7,7 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -29,15 +29,30 @@ import (
 
 type Client struct {
 	client *client.Client
+	logger *log.Logger
 }
+
+var logger *log.Logger
 
 type RoutingTable struct {
 	Routes map[string]*TraefikConfig // map the domain to the details of the container. This will be used to match the request to the correct container
 	rw     sync.RWMutex
+	logger *log.Logger
 }
 
 var routingTable = RoutingTable{
 	Routes: make(map[string]*TraefikConfig),
+}
+
+func init() {
+	logFile, err := os.OpenFile("proxy.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatal("Failed to open log file:", err)
+	}
+	logger = log.New(logFile, "", log.LstdFlags)
+
+	// Initialize the logger field in the routingTable variable after the global logger is initialized
+	routingTable.logger = logger
 }
 
 func main() {
@@ -50,25 +65,26 @@ func main() {
 	// the container that will be serving up the request.
 	// we might have something like this |domain|container/service|port|
 
-	u, err := url.Parse("http://127.0.0.1:8000")
-	if err != nil {
-		fmt.Println(err)
-	}
-
 	// proxy server
 	proxy := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		// we are going to use the parsed url as the demo url we wanna play with
-		// and be forwarding requests to and receiving responses from.
+		// get the domain information from the routing table
+		formattedHost := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(req.Host, "http://"), "https://"), ":80")
+		domain := routingTable.getRouteForDomain(formattedHost)
+		if domain == nil {
+			logger.Printf("No route found for domain: %s", formattedHost)
+			rw.WriteHeader(http.StatusNotFound)
+			rw.Write([]byte("No route found for domain: " + formattedHost))
+			return
+		}
 
 		address, _, err := net.SplitHostPort(req.RemoteAddr)
 		if err != nil {
-			fmt.Println("There was an error splitting the host")
+			logger.Printf("There was an error splitting the host: %s", err)
 		}
 		req.Header.Set("X-Forwarded-For", address)
-		req.URL.Host = u.Host
-		req.URL.Scheme = u.Scheme
+		req.URL.Host = domain.IPAddress + ":" + domain.Port
+		req.URL.Scheme = "http"
 		req.RequestURI = ""
-
 		// after updating the details of the incoming request to now point to
 		// the sample server we have, we have to make sure that we now perform
 		// the request to that particular server and get the response and write it
@@ -77,6 +93,7 @@ func main() {
 		// we don't want the whole process to block forever if the backend is rather
 		// not responding or slow, we need to set a timeout for the request.
 		// we have a 30 second timeout for the whole process.
+		logger.Printf("Making request to: %s", req.URL.String())
 		ctx, cancel := context.WithTimeout(req.Context(), 30*time.Second)
 		defer cancel()
 		req = req.WithContext(ctx)
@@ -172,6 +189,7 @@ func main() {
 	}
 	dockerClient := Client{
 		client: cli,
+		logger: logger,
 	}
 	go dockerClient.listenToContainerEvents()
 	http.ListenAndServe(":8080", proxy)
@@ -190,7 +208,7 @@ func (c *Client) listenToContainerEvents() {
 	// we will then update the routing table with the details of the container
 	// and the details of the service that will be serving up requests for
 	// that container.
-	fmt.Println("Listening to container events...")
+	c.logger.Println("Listening to container events...")
 
 	eventsChan, errChan := c.client.Events(context.Background(), events.ListOptions{
 		Filters: filters.NewArgs(filters.KeyValuePair{Key: "type", Value: "container"}),
@@ -200,6 +218,7 @@ func (c *Client) listenToContainerEvents() {
 		for {
 			select {
 			case event := <-eventsChan:
+				c.logger.Printf("Received container event: %s", event.Status)
 				c.processContainerEvent(event)
 			case err := <-errChan:
 				if err != nil {
@@ -213,6 +232,7 @@ func (c *Client) listenToContainerEvents() {
 // processContainerEvent processes a container event and updates the routing table
 // based on the event type.
 func (c *Client) processContainerEvent(event events.Message) {
+	c.logger.Printf("Processing container event: %s", event.Status)
 	switch event.Status {
 	case "start", "update":
 		// Continue processing
@@ -222,14 +242,14 @@ func (c *Client) processContainerEvent(event events.Message) {
 
 	container, err := c.client.ContainerInspect(context.Background(), event.Actor.ID)
 	if err != nil {
-		fmt.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
+		c.logger.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
 		return
 	}
 
 	// Fetch complete container details to get all labels
 	container, err = c.client.ContainerInspect(context.Background(), event.Actor.ID)
 	if err != nil {
-		fmt.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
+		c.logger.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
 		return
 	}
 
@@ -238,7 +258,7 @@ func (c *Client) processContainerEvent(event events.Message) {
 	// and if so, we need to remove it from the routing table.
 	// todo: implement this
 	if enabled, exists := container.Config.Labels["traefik.enable"]; !exists || enabled != "true" {
-		fmt.Printf("Container %s is not enabled for traefik\n", container.Name)
+		c.logger.Printf("Container %s is not enabled for traefik\n", container.Name)
 		return
 	}
 
@@ -274,15 +294,15 @@ func (c *Client) processContainerEvent(event events.Message) {
 	config.Domain = getCleanDomainFromHostLabel(config.Rule)
 	config.Port = labels[fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", routerName)]
 
-	fmt.Printf("Traefik Configuration for %s:\n", containerName)
-	fmt.Printf("  Container ID: %s\n", config.ContainerID)
-	fmt.Printf("  Router Name: %s\n", routerName)
-	fmt.Printf("  Rule: %s\n", config.Rule)
-	fmt.Printf("  Port: %s\n", config.Port)
-	fmt.Printf("  IP Address: %s\n", config.IPAddress)
-	fmt.Printf("  Networks: %v\n", config.Networks)
-	fmt.Printf("  All Labels: %v\n", config.Labels)
-	fmt.Printf("  Domain: %s\n", config.Domain)
+	c.logger.Printf("Traefik Configuration for %s:\n", containerName)
+	c.logger.Printf("  Container ID: %s\n", config.ContainerID)
+	c.logger.Printf("  Router Name: %s\n", routerName)
+	c.logger.Printf("  Rule: %s\n", config.Rule)
+	c.logger.Printf("  Port: %s\n", config.Port)
+	c.logger.Printf("  IP Address: %s\n", config.IPAddress)
+	c.logger.Printf("  Networks: %v\n", config.Networks)
+	c.logger.Printf("  All Labels: %v\n", config.Labels)
+	c.logger.Printf("  Domain: %s\n", config.Domain)
 	// TODO: Update your routing table here
 	routingTable.updateRoutingTable(&config)
 }
@@ -331,12 +351,14 @@ func getCleanDomainFromHostLabel(label string) string {
 func (router *RoutingTable) updateRoutingTable(config *TraefikConfig) {
 	// Implement your routing table update logic here
 	// This could be updating a shared map, database, or other storage
-	log.Printf("Updating routing table for domain: %s", config.Domain)
+	router.logger.Printf("Updating routing table for domain: %s", config.Domain)
+
 	router.rw.Lock()
 	defer router.rw.Unlock()
+
 	router.Routes[config.Domain] = config
-	log.Printf("Routing table updated for domain: %s", config.Domain)
-	log.Printf("Routing table: %v", router.Routes)
+	router.logger.Printf("Routing table updated for domain: %s", config.Domain)
+	router.logger.Printf("Routing table: %v", router.Routes)
 }
 
 // getRouteForDomain gets the routing information for a given domain from the routing table
