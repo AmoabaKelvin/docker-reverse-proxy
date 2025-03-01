@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/events"
@@ -32,6 +33,7 @@ type Client struct {
 
 type RoutingTable struct {
 	Routes map[string]*TraefikConfig // map the domain to the details of the container. This will be used to match the request to the correct container
+	rw     sync.RWMutex
 }
 
 var routingTable = RoutingTable{
@@ -330,12 +332,16 @@ func (router *RoutingTable) updateRoutingTable(config *TraefikConfig) {
 	// Implement your routing table update logic here
 	// This could be updating a shared map, database, or other storage
 	log.Printf("Updating routing table for domain: %s", config.Domain)
+	router.rw.Lock()
+	defer router.rw.Unlock()
 	router.Routes[config.Domain] = config
 	log.Printf("Routing table updated for domain: %s", config.Domain)
 	log.Printf("Routing table: %v", router.Routes)
 }
 
 // getRouteForDomain gets the routing information for a given domain from the routing table
-// func (router *RoutingTable) getRouteForDomain(domain string) *TraefikConfig {
-// 	return router.Routes[domain]
-// }
+func (router *RoutingTable) getRouteForDomain(domain string) *TraefikConfig {
+	router.rw.RLock()
+	defer router.rw.RUnlock()
+	return router.Routes[domain]
+}
