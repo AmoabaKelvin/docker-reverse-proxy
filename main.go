@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -27,6 +28,14 @@ import (
 
 type Client struct {
 	client *client.Client
+}
+
+type RoutingTable struct {
+	Routes map[string]*TraefikConfig // map the domain to the details of the container. This will be used to match the request to the correct container
+}
+
+var routingTable = RoutingTable{
+	Routes: make(map[string]*TraefikConfig),
 }
 
 func main() {
@@ -273,7 +282,7 @@ func (c *Client) processContainerEvent(event events.Message) {
 	fmt.Printf("  All Labels: %v\n", config.Labels)
 	fmt.Printf("  Domain: %s\n", config.Domain)
 	// TODO: Update your routing table here
-	updateRoutingTable(config)
+	routingTable.updateRoutingTable(&config)
 }
 
 // TraefikConfig holds the parsed configuration for a container
@@ -317,9 +326,16 @@ func getCleanDomainFromHostLabel(label string) string {
 }
 
 // updateRoutingTable updates the routing table with the details of the container
-// this will be a map of the router name to the details of the container
-// that is serving up requests for that router.
-func updateRoutingTable(config TraefikConfig) {
+func (router *RoutingTable) updateRoutingTable(config *TraefikConfig) {
 	// Implement your routing table update logic here
 	// This could be updating a shared map, database, or other storage
+	log.Printf("Updating routing table for domain: %s", config.Domain)
+	router.Routes[config.Domain] = config
+	log.Printf("Routing table updated for domain: %s", config.Domain)
+	log.Printf("Routing table: %v", router.Routes)
 }
+
+// getRouteForDomain gets the routing information for a given domain from the routing table
+// func (router *RoutingTable) getRouteForDomain(domain string) *TraefikConfig {
+// 	return router.Routes[domain]
+// }
