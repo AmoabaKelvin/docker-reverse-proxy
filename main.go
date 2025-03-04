@@ -229,34 +229,38 @@ func (c *Client) listenToContainerEvents() {
 	}()
 }
 
+func (c *Client) inspectAndReturnLabels(containerID string) (map[string]string, error) {
+	container, err := c.client.ContainerInspect(context.Background(), containerID)
+	if err != nil {
+		return nil, err
+	}
+	return container.Config.Labels, nil
+}
+
 // processContainerEvent processes a container event and updates the routing table
 // based on the event type.
 func (c *Client) processContainerEvent(event events.Message) {
 	c.logger.Printf("Processing container event: %s", event.Status)
-	switch event.Status {
-	case "start", "update":
-		// Continue processing
-	default:
-		return // Ignore other events
+
+	// Handle container stop events
+	if event.Status == "die" || event.Status == "stop" || event.Status == "kill" {
+		c.handleContainerStopEvent(event)
+		return
 	}
 
+	// Handle only start and update events for the rest of the function
+	if event.Status != "start" && event.Status != "update" {
+		return
+	}
+
+	// Fetch complete container details to get all labels
 	container, err := c.client.ContainerInspect(context.Background(), event.Actor.ID)
 	if err != nil {
 		c.logger.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
 		return
 	}
 
-	// Fetch complete container details to get all labels
-	container, err = c.client.ContainerInspect(context.Background(), event.Actor.ID)
-	if err != nil {
-		c.logger.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
-		return
-	}
-
-	// Check if container should be managed by traefik. If not, we don't need to process it
-	// we will need to check the routing table to see if this container is being used in any of the routes
-	// and if so, we need to remove it from the routing table.
-	// todo: implement this
+	// Check if container should be managed by traefik
 	if enabled, exists := container.Config.Labels["traefik.enable"]; !exists || enabled != "true" {
 		c.logger.Printf("Container %s is not enabled for traefik\n", container.Name)
 		return
@@ -303,8 +307,53 @@ func (c *Client) processContainerEvent(event events.Message) {
 	c.logger.Printf("  Networks: %v\n", config.Networks)
 	c.logger.Printf("  All Labels: %v\n", config.Labels)
 	c.logger.Printf("  Domain: %s\n", config.Domain)
-	// TODO: Update your routing table here
+
+	// Update routing table
 	routingTable.updateRoutingTable(&config)
+}
+
+// handleContainerStopEvent handles die, stop, and kill events
+func (c *Client) handleContainerStopEvent(event events.Message) {
+	containerName := event.Actor.Attributes["name"]
+	c.logger.Printf("Container %s is being stopped/killed", containerName)
+
+	// First try to find the container in the routing table by ID
+	for domain, config := range routingTable.Routes {
+		if config.ContainerID == event.Actor.ID {
+			c.logger.Printf("Removing route from routing table for domain: %s\n", domain)
+			routingTable.removeRouteFromRoutingTable(domain)
+			return
+		}
+	}
+
+	// If not found in routing table, check if traefik.enable is in the attributes
+	if enabled, exists := event.Actor.Attributes["traefik.enable"]; exists && enabled == "true" {
+		c.logger.Printf("Container %s has traefik.enable=true but no matching route found\n", containerName)
+		return
+	}
+
+	// As a last resort, try to inspect the container
+	labels, err := c.inspectAndReturnLabels(event.Actor.ID)
+	if err != nil {
+		c.logger.Printf("Error inspecting container %s: %v\n", event.Actor.ID, err)
+		return
+	}
+
+	// Check if container should be managed by traefik
+	if enabled, exists := labels["traefik.enable"]; !exists || enabled != "true" {
+		c.logger.Printf("Container %s is not enabled for traefik\n", event.Actor.ID)
+		return
+	}
+
+	// Get domain from labels
+	domain := getCleanDomainFromHostLabel(labels[fmt.Sprintf("traefik.http.routers.%s.rule", containerName)])
+	if domain == "" {
+		c.logger.Printf("No domain found for container %s\n", event.Actor.ID)
+		return
+	}
+
+	c.logger.Printf("Removing route from routing table for domain: %s\n", domain)
+	routingTable.removeRouteFromRoutingTable(domain)
 }
 
 // TraefikConfig holds the parsed configuration for a container
@@ -366,4 +415,12 @@ func (router *RoutingTable) getRouteForDomain(domain string) *TraefikConfig {
 	router.rw.RLock()
 	defer router.rw.RUnlock()
 	return router.Routes[domain]
+}
+
+// removeRouteFromRoutingTable removes a route from the routing table
+func (router *RoutingTable) removeRouteFromRoutingTable(domain string) {
+	router.rw.Lock()
+	defer router.rw.Unlock()
+	delete(router.Routes, domain)
+	router.logger.Printf("Route removed from routing table for domain: %s", domain)
 }
